@@ -1,12 +1,10 @@
-# coding: utf8
-
 import collections
 from urllib import parse
 
-from hypothesis import assume, given, settings
-
 import http_strategies
 from http_base import DaphneTestCase
+from hypothesis import assume, given, settings
+from hypothesis.strategies import integers
 
 
 class TestHTTPRequest(DaphneTestCase):
@@ -24,23 +22,26 @@ class TestHTTPRequest(DaphneTestCase):
         # Check overall keys
         self.assert_key_sets(
             required_keys={
+                "asgi",
                 "type",
                 "http_version",
                 "method",
                 "path",
+                "raw_path",
                 "query_string",
                 "headers",
             },
             optional_keys={"scheme", "root_path", "client", "server"},
             actual_keys=scope.keys(),
         )
+        self.assertEqual(scope["asgi"]["version"], "3.0")
         # Check that it is the right type
         self.assertEqual(scope["type"], "http")
         # Method (uppercased unicode string)
         self.assertIsInstance(scope["method"], str)
         self.assertEqual(scope["method"], method.upper())
         # Path
-        self.assert_valid_path(scope["path"], path)
+        self.assert_valid_path(scope["path"])
         # HTTP version
         self.assertIn(scope["http_version"], ["1.0", "1.1", "1.2"])
         # Scheme
@@ -119,6 +120,26 @@ class TestHTTPRequest(DaphneTestCase):
         self.assert_valid_http_scope(scope, "GET", request_path, params=request_params)
         self.assert_valid_http_request_message(messages[0], body=b"")
 
+    @given(request_path=http_strategies.http_path(), chunk_size=integers(min_value=1))
+    @settings(max_examples=5, deadline=5000)
+    def test_request_body_chunking(self, request_path, chunk_size):
+        """
+        Tests request body chunking logic.
+        """
+        body = b"The quick brown fox jumps over the lazy dog"
+        _, messages = self.run_daphne_request(
+            "POST",
+            request_path,
+            body=body,
+            request_buffer_size=chunk_size,
+        )
+
+        # Avoid running those asserts when there's a single "http.disconnect"
+        if len(messages) > 1:
+            assert messages[0]["body"].decode() == body.decode()[:chunk_size]
+            assert not messages[-2]["more_body"]
+            assert messages[-1] == {"type": "http.disconnect"}
+
     @given(
         request_path=http_strategies.http_path(),
         request_body=http_strategies.http_body(),
@@ -134,13 +155,21 @@ class TestHTTPRequest(DaphneTestCase):
         self.assert_valid_http_scope(scope, "POST", request_path)
         self.assert_valid_http_request_message(messages[0], body=request_body)
 
+    def test_raw_path(self):
+        """
+        Tests that /foo%2Fbar produces raw_path and a decoded path
+        """
+        scope, _ = self.run_daphne_request("GET", "/foo%2Fbar")
+        self.assertEqual(scope["path"], "/foo/bar")
+        self.assertEqual(scope["raw_path"], b"/foo%2Fbar")
+
     @given(request_headers=http_strategies.headers())
     @settings(max_examples=5, deadline=5000)
     def test_headers(self, request_headers):
         """
         Tests that HTTP header fields are handled as specified
         """
-        request_path = "/te st-à/"
+        request_path = parse.quote("/te st-à/")
         scope, messages = self.run_daphne_request(
             "OPTIONS", request_path, headers=request_headers
         )
@@ -160,7 +189,7 @@ class TestHTTPRequest(DaphneTestCase):
         header_name = request_headers[0][0]
         duplicated_headers = [(header_name, header[1]) for header in request_headers]
         # Run the request
-        request_path = "/te st-à/"
+        request_path = parse.quote("/te st-à/")
         scope, messages = self.run_daphne_request(
             "OPTIONS", request_path, headers=duplicated_headers
         )
@@ -281,3 +310,15 @@ class TestHTTPRequest(DaphneTestCase):
             b"GET /?\xc3\xa4\xc3\xb6\xc3\xbc HTTP/1.0\r\n\r\n"
         )
         self.assertTrue(response.startswith(b"HTTP/1.0 400 Bad Request"))
+
+    def test_invalid_header_name(self):
+        """
+        Tests that requests with invalid header names fail.
+        """
+        # Test cases follow those used by h11
+        # https://github.com/python-hyper/h11/blob/a2c68948accadc3876dffcf979d98002e4a4ed27/h11/tests/test_headers.py#L24-L35
+        for header_name in [b"foo bar", b"foo\x00bar", b"foo\xffbar", b"foo\x01bar"]:
+            response = self.run_daphne_raw(
+                f"GET / HTTP/1.0\r\n{header_name}: baz\r\n\r\n".encode("ascii")
+            )
+            self.assertTrue(response.startswith(b"HTTP/1.0 400 Bad Request"))

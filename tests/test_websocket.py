@@ -1,13 +1,12 @@
-# coding: utf8
-
 import collections
 import time
 from urllib import parse
 
-from hypothesis import given, settings
-
 import http_strategies
 from http_base import DaphneTestCase, DaphneTestingInstance
+from hypothesis import given, settings
+
+from daphne.testing import BaseDaphneTestingInstance
 
 
 class TestWebsocket(DaphneTestCase):
@@ -24,14 +23,22 @@ class TestWebsocket(DaphneTestCase):
         """
         # Check overall keys
         self.assert_key_sets(
-            required_keys={"type", "path", "query_string", "headers"},
+            required_keys={
+                "asgi",
+                "type",
+                "path",
+                "raw_path",
+                "query_string",
+                "headers",
+            },
             optional_keys={"scheme", "root_path", "client", "server", "subprotocols"},
             actual_keys=scope.keys(),
         )
+        self.assertEqual(scope["asgi"]["version"], "3.0")
         # Check that it is the right type
         self.assertEqual(scope["type"], "websocket")
         # Path
-        self.assert_valid_path(scope["path"], path)
+        self.assert_valid_path(scope["path"])
         # Scheme
         self.assertIn(scope.get("scheme", "ws"), ["ws", "wss"])
         if scheme:
@@ -161,7 +168,7 @@ class TestWebsocket(DaphneTestCase):
             test_app.add_send_messages([{"type": "websocket.accept"}])
             self.websocket_handshake(
                 test_app,
-                path=request_path,
+                path=parse.quote(request_path),
                 params=request_params,
                 headers=request_headers,
             )
@@ -171,6 +178,43 @@ class TestWebsocket(DaphneTestCase):
                 scope, path=request_path, params=request_params, headers=request_headers
             )
             self.assert_valid_websocket_connect_message(messages[0])
+
+    def test_raw_path(self):
+        """
+        Tests that /foo%2Fbar produces raw_path and a decoded path
+        """
+        with DaphneTestingInstance() as test_app:
+            test_app.add_send_messages([{"type": "websocket.accept"}])
+            self.websocket_handshake(test_app, path="/foo%2Fbar")
+            # Validate the scope and messages we got
+            scope, _ = test_app.get_received()
+
+        self.assertEqual(scope["path"], "/foo/bar")
+        self.assertEqual(scope["raw_path"], b"/foo%2Fbar")
+
+    @given(daphne_path=http_strategies.http_path())
+    @settings(max_examples=5, deadline=2000)
+    def test_root_path(self, *, daphne_path):
+        """
+        Tests root_path handling.
+        """
+        headers = [("Daphne-Root-Path", parse.quote(daphne_path))]
+        with DaphneTestingInstance() as test_app:
+            test_app.add_send_messages([{"type": "websocket.accept"}])
+            self.websocket_handshake(
+                test_app,
+                path="/",
+                headers=headers,
+            )
+            # Validate the scope and messages we got
+            scope, _ = test_app.get_received()
+
+        # Daphne-Root-Path is not included in the returned 'headers' section.
+        self.assertNotIn(
+            "daphne-root-path", (header[0].lower() for header in scope["headers"])
+        )
+        # And what we're looking for, root_path being set.
+        self.assertEqual(scope["root_path"], daphne_path)
 
     def test_text_frames(self):
         """
@@ -241,3 +285,54 @@ class TestWebsocket(DaphneTestCase):
             self.websocket_send_frame(sock, "still alive?")
             # Receive a frame and make sure it's correct
             assert self.websocket_receive_frame(sock) == "cake"
+
+    def test_application_checker_handles_asyncio_cancellederror(self):
+        with CancellingTestingInstance() as app:
+            # Connect to the websocket app, it will immediately raise
+            # asyncio.CancelledError
+            sock, _ = self.websocket_handshake(app)
+            # Disconnect from the socket
+            sock.close()
+            # Wait for application_checker to clean up the applications for
+            # disconnected clients, and for the server to be stopped.
+            time.sleep(3)
+            # Make sure we received either no error, or a ConnectionsNotEmpty
+            while not app.process.errors.empty():
+                err, _tb = app.process.errors.get()
+                if not isinstance(err, ConnectionsNotEmpty):
+                    raise err
+                self.fail(
+                    "Server connections were not cleaned up after an asyncio.CancelledError was raised"
+                )
+
+
+async def cancelling_application(scope, receive, send):
+    import asyncio
+
+    from twisted.internet import reactor
+
+    # Stop the server after a short delay so that the teardown is run.
+    reactor.callLater(2, reactor.stop)
+    await send({"type": "websocket.accept"})
+    raise asyncio.CancelledError()
+
+
+class ConnectionsNotEmpty(Exception):
+    pass
+
+
+class CancellingTestingInstance(BaseDaphneTestingInstance):
+    def __init__(self):
+        super().__init__(application=cancelling_application)
+
+    def process_teardown(self):
+        import multiprocessing
+
+        # Get a hold of the enclosing DaphneProcess (we're currently running in
+        # the same process as the application).
+        proc = multiprocessing.current_process()
+        # By now the (only) socket should have disconnected, and the
+        # application_checker should have run. If there are any connections
+        # still, it means that the application_checker did not clean them up.
+        if proc.server.connections:
+            raise ConnectionsNotEmpty()

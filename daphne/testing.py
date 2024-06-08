@@ -6,13 +6,8 @@ import tempfile
 import traceback
 from concurrent.futures import CancelledError
 
-from twisted.internet import reactor
 
-from .endpoints import build_endpoint_description_strings
-from .server import Server
-
-
-class DaphneTestingInstance:
+class BaseDaphneTestingInstance:
     """
     Launches an instance of Daphne in a subprocess, with a host and port
     attribute allowing you to call it.
@@ -22,17 +17,23 @@ class DaphneTestingInstance:
 
     startup_timeout = 2
 
-    def __init__(self, xff=False, http_timeout=None):
+    def __init__(
+        self, xff=False, http_timeout=None, request_buffer_size=None, *, application
+    ):
         self.xff = xff
         self.http_timeout = http_timeout
         self.host = "127.0.0.1"
+        self.request_buffer_size = request_buffer_size
+        self.application = application
+
+    def get_application(self):
+        return self.application
 
     def __enter__(self):
-        # Clear result storage
-        TestApplication.delete_setup()
-        TestApplication.delete_result()
         # Option Daphne features
         kwargs = {}
+        if self.request_buffer_size:
+            kwargs["request_buffer_size"] = self.request_buffer_size
         # Optionally enable X-Forwarded-For support.
         if self.xff:
             kwargs["proxy_forwarded_address_header"] = "X-Forwarded-For"
@@ -43,7 +44,7 @@ class DaphneTestingInstance:
         # Start up process
         self.process = DaphneProcess(
             host=self.host,
-            application=TestApplication,
+            get_application=self.get_application,
             kwargs=kwargs,
             setup=self.process_setup,
             teardown=self.process_teardown,
@@ -78,6 +79,21 @@ class DaphneTestingInstance:
         pass
 
     def get_received(self):
+        pass
+
+
+class DaphneTestingInstance(BaseDaphneTestingInstance):
+    def __init__(self, *args, **kwargs):
+        self.lock = multiprocessing.Lock()
+        super().__init__(*args, **kwargs, application=TestApplication(lock=self.lock))
+
+    def __enter__(self):
+        # Clear result storage
+        TestApplication.delete_setup()
+        TestApplication.delete_result()
+        return super().__enter__()
+
+    def get_received(self):
         """
         Returns the scope and messages the test application has received
         so far. Note you'll get all messages since scope start, not just any
@@ -87,7 +103,8 @@ class DaphneTestingInstance:
         raises them.
         """
         try:
-            inner_result = TestApplication.load_result()
+            with self.lock:
+                inner_result = TestApplication.load_result()
         except FileNotFoundError:
             raise ValueError("No results available yet.")
         # Check for exception
@@ -109,23 +126,36 @@ class DaphneProcess(multiprocessing.Process):
     port it ends up listening on back to the parent process.
     """
 
-    def __init__(self, host, application, kwargs=None, setup=None, teardown=None):
+    def __init__(self, host, get_application, kwargs=None, setup=None, teardown=None):
         super().__init__()
         self.host = host
-        self.application = application
+        self.get_application = get_application
         self.kwargs = kwargs or {}
-        self.setup = setup or (lambda: None)
-        self.teardown = teardown or (lambda: None)
+        self.setup = setup
+        self.teardown = teardown
         self.port = multiprocessing.Value("i")
         self.ready = multiprocessing.Event()
         self.errors = multiprocessing.Queue()
 
     def run(self):
+        # OK, now we are in a forked child process, and want to use the reactor.
+        # However, FreeBSD systems like MacOS do not fork the underlying Kqueue,
+        # which asyncio (hence asyncioreactor) is built on.
+        # Therefore, we should uninstall the broken reactor and install a new one.
+        _reinstall_reactor()
+
+        from twisted.internet import reactor
+
+        from .endpoints import build_endpoint_description_strings
+        from .server import Server
+
+        application = self.get_application()
+
         try:
             # Create the server class
             endpoints = build_endpoint_description_strings(host=self.host, port=0)
             self.server = Server(
-                application=self.application,
+                application=application,
                 endpoints=endpoints,
                 signal_handlers=False,
                 **self.kwargs
@@ -133,16 +163,20 @@ class DaphneProcess(multiprocessing.Process):
             # Set up a poller to look for the port
             reactor.callLater(0.1, self.resolve_port)
             # Run with setup/teardown
-            self.setup()
+            if self.setup is not None:
+                self.setup()
             try:
                 self.server.run()
             finally:
-                self.teardown()
-        except Exception as e:
+                if self.teardown is not None:
+                    self.teardown()
+        except BaseException as e:
             # Put the error on our queue so the parent gets it
             self.errors.put((e, traceback.format_exc()))
 
     def resolve_port(self):
+        from twisted.internet import reactor
+
         if self.server.listening_addresses:
             self.port.value = self.server.listening_addresses[0][1]
             self.ready.set()
@@ -159,19 +193,22 @@ class TestApplication:
     setup_storage = os.path.join(tempfile.gettempdir(), "setup.testio")
     result_storage = os.path.join(tempfile.gettempdir(), "result.testio")
 
-    def __init__(self, scope):
-        self.scope = scope
+    def __init__(self, lock):
+        self.lock = lock
         self.messages = []
 
-    async def __call__(self, send, receive):
+    async def __call__(self, scope, receive, send):
+        self.scope = scope
         # Receive input and send output
         logging.debug("test app coroutine alive")
         try:
             while True:
                 # Receive a message and save it into the result store
                 self.messages.append(await receive())
+                self.lock.acquire()
                 logging.debug("test app received %r", self.messages[-1])
                 self.save_result(self.scope, self.messages)
+                self.lock.release()
                 # See if there are any messages to send back
                 setup = self.load_setup()
                 self.delete_setup()
@@ -249,3 +286,24 @@ class TestApplication:
             os.unlink(cls.result_storage)
         except OSError:
             pass
+
+
+def _reinstall_reactor():
+    import asyncio
+    import sys
+
+    from twisted.internet import asyncioreactor
+
+    # Uninstall the reactor.
+    if "twisted.internet.reactor" in sys.modules:
+        del sys.modules["twisted.internet.reactor"]
+
+    # The daphne.server module may have already installed the reactor.
+    # If so, using this module will use uninstalled one, thus we should
+    # reimport this module too.
+    if "daphne.server" in sys.modules:
+        del sys.modules["daphne.server"]
+
+    event_loop = asyncio.new_event_loop()
+    asyncioreactor.install(event_loop)
+    asyncio.set_event_loop(event_loop)

@@ -1,7 +1,17 @@
 # This has to be done first as Twisted is import-order-sensitive with reactors
+import asyncio  # isort:skip
+import os  # isort:skip
 import sys  # isort:skip
 import warnings  # isort:skip
+from concurrent.futures import ThreadPoolExecutor  # isort:skip
 from twisted.internet import asyncioreactor  # isort:skip
+
+
+twisted_loop = asyncio.new_event_loop()
+if "ASGI_THREADS" in os.environ:
+    twisted_loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=int(os.environ["ASGI_THREADS"]))
+    )
 
 current_reactor = sys.modules.get("twisted.internet.reactor", None)
 if current_reactor is not None:
@@ -11,17 +21,17 @@ if current_reactor is not None:
             + "you can fix this warning by importing daphne.server early in your codebase or "
             + "finding the package that imports Twisted and importing it later on.",
             UserWarning,
+            stacklevel=2,
         )
         del sys.modules["twisted.internet.reactor"]
-        asyncioreactor.install()
+        asyncioreactor.install(twisted_loop)
 else:
-    asyncioreactor.install()
+    asyncioreactor.install(twisted_loop)
 
-import asyncio
 import logging
 import time
-import traceback
 from concurrent.futures import CancelledError
+from functools import partial
 
 from twisted.internet import defer, reactor
 from twisted.internet.endpoints import serverFromString
@@ -34,7 +44,7 @@ from .ws_protocol import WebSocketFactory
 logger = logging.getLogger(__name__)
 
 
-class Server(object):
+class Server:
     def __init__(
         self,
         application,
@@ -42,6 +52,7 @@ class Server(object):
         signal_handlers=True,
         action_logger=None,
         http_timeout=None,
+        request_buffer_size=8192,
         websocket_timeout=86400,
         websocket_connect_timeout=20,
         ping_interval=20,
@@ -54,9 +65,7 @@ class Server(object):
         websocket_handshake_timeout=5,
         application_close_timeout=10,
         ready_callable=None,
-        server_name="Daphne",
-        # Deprecated and does not work, remove in version 2.2
-        ws_protocols=None,
+        server_name="daphne",
     ):
         self.application = application
         self.endpoints = endpoints or []
@@ -67,6 +76,7 @@ class Server(object):
         self.http_timeout = http_timeout
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
+        self.request_buffer_size = request_buffer_size
         self.proxy_forwarded_address_header = proxy_forwarded_address_header
         self.proxy_forwarded_port_header = proxy_forwarded_port_header
         self.proxy_forwarded_proto_header = proxy_forwarded_proto_header
@@ -197,15 +207,17 @@ class Server(object):
         assert "application_instance" not in self.connections[protocol]
         # Make an instance of the application
         input_queue = asyncio.Queue()
-        application_instance = self.application(scope=scope)
+        scope.setdefault("asgi", {"version": "3.0"})
+        application_instance = self.application(
+            scope=scope,
+            receive=input_queue.get,
+            send=partial(self.handle_reply, protocol),
+        )
         # Run it, and stash the future for later checking
         if protocol not in self.connections:
             return None
         self.connections[protocol]["application_instance"] = asyncio.ensure_future(
-            application_instance(
-                receive=input_queue.get,
-                send=lambda message: self.handle_reply(protocol, message),
-            ),
+            application_instance,
             loop=asyncio.get_event_loop(),
         )
         return input_queue
@@ -219,7 +231,12 @@ class Server(object):
             "disconnected", None
         ):
             return
-        self.check_headers_type(message)
+        try:
+            self.check_headers_type(message)
+        except ValueError:
+            # Ensure to send SOME reply.
+            protocol.basic_error(500, b"Server Error", "Server Error")
+            raise
         # Let the protocol handle it
         protocol.handle_reply(message)
 
@@ -268,7 +285,7 @@ class Server(object):
             if application_instance and application_instance.done():
                 try:
                     exception = application_instance.exception()
-                except CancelledError:
+                except (CancelledError, asyncio.CancelledError):
                     # Future cancellation. We can ignore this.
                     pass
                 else:
@@ -277,13 +294,10 @@ class Server(object):
                             # Protocol is asking the server to exit (likely during test)
                             self.stop()
                         else:
-                            exception_output = "{}\n{}{}".format(
-                                exception,
-                                "".join(traceback.format_tb(exception.__traceback__)),
-                                "  {}".format(exception),
-                            )
                             logger.error(
-                                "Exception inside application: %s", exception_output
+                                "Exception inside application: %s",
+                                exception,
+                                exc_info=exception,
                             )
                             if not disconnected:
                                 protocol.handle_exception(exception)

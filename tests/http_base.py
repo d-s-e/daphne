@@ -20,20 +20,29 @@ class DaphneTestCase(unittest.TestCase):
     ### Plain HTTP helpers
 
     def run_daphne_http(
-        self, method, path, params, body, responses, headers=None, timeout=1, xff=False
+        self,
+        method,
+        path,
+        params,
+        body,
+        responses,
+        headers=None,
+        timeout=1,
+        xff=False,
+        request_buffer_size=None,
     ):
         """
         Runs Daphne with the given request callback (given the base URL)
         and response messages.
         """
-        with DaphneTestingInstance(xff=xff) as test_app:
+        with DaphneTestingInstance(
+            xff=xff, request_buffer_size=request_buffer_size
+        ) as test_app:
             # Add the response messages
             test_app.add_send_messages(responses)
             # Send it the request. We have to do this the long way to allow
             # duplicate headers.
             conn = HTTPConnection(test_app.host, test_app.port, timeout=timeout)
-            # Make sure path is urlquoted and add any params
-            path = parse.quote(path)
             if params:
                 path += "?" + parse.urlencode(params, doseq=True)
             conn.putrequest(method, path, skip_accept_encoding=True, skip_host=True)
@@ -58,12 +67,16 @@ class DaphneTestCase(unittest.TestCase):
             # Return scope, messages, response
             return test_app.get_received() + (response,)
 
-    def run_daphne_raw(self, data, timeout=1):
+    def run_daphne_raw(self, data, *, responses=None, timeout=1):
         """
-        Runs daphne and sends it the given raw bytestring over a socket. Returns what it sends back.
+        Runs Daphne and sends it the given raw bytestring over a socket.
+        Accepts list of response messages the application will reply with.
+        Returns what Daphne sends back.
         """
         assert isinstance(data, bytes)
         with DaphneTestingInstance() as test_app:
+            if responses is not None:
+                test_app.add_send_messages(responses)
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -77,7 +90,14 @@ class DaphneTestCase(unittest.TestCase):
                 )
 
     def run_daphne_request(
-        self, method, path, params=None, body=None, headers=None, xff=False
+        self,
+        method,
+        path,
+        params=None,
+        body=None,
+        headers=None,
+        xff=False,
+        request_buffer_size=None,
     ):
         """
         Convenience method for just testing request handling.
@@ -90,6 +110,7 @@ class DaphneTestCase(unittest.TestCase):
             body=body,
             headers=headers,
             xff=xff,
+            request_buffer_size=request_buffer_size,
             responses=[
                 {"type": "http.response.start", "status": 200},
                 {"type": "http.response.body", "body": b"OK"},
@@ -128,8 +149,6 @@ class DaphneTestCase(unittest.TestCase):
         # Send it the request. We have to do this the long way to allow
         # duplicate headers.
         conn = HTTPConnection(test_app.host, test_app.port, timeout=timeout)
-        # Make sure path is urlquoted and add any params
-        path = parse.quote(path)
         if params:
             path += "?" + parse.urlencode(params, doseq=True)
         conn.putrequest("GET", path, skip_accept_encoding=True, skip_host=True)
@@ -163,7 +182,7 @@ class DaphneTestCase(unittest.TestCase):
         if response.status != 101:
             raise RuntimeError("WebSocket upgrade did not result in status code 101")
         # Prepare headers for subprotocol searching
-        response_headers = dict((n.lower(), v) for n, v in response.getheaders())
+        response_headers = {n.lower(): v for n, v in response.getheaders()}
         response.read()
         assert not response.closed
         # Return the raw socket and any subprotocol
@@ -233,7 +252,7 @@ class DaphneTestCase(unittest.TestCase):
         """
         try:
             socket.inet_aton(address)
-        except socket.error:
+        except OSError:
             self.fail("'%s' is not a valid IP address." % address)
 
     def assert_key_sets(self, required_keys, optional_keys, actual_keys):
@@ -247,12 +266,11 @@ class DaphneTestCase(unittest.TestCase):
         # Assert that no other keys are present
         self.assertEqual(set(), present_keys - required_keys - optional_keys)
 
-    def assert_valid_path(self, path, request_path):
+    def assert_valid_path(self, path):
         """
         Checks the path is valid and already url-decoded.
         """
         self.assertIsInstance(path, str)
-        self.assertEqual(path, request_path)
         # Assert that it's already url decoded
         self.assertEqual(path, parse.unquote(path))
 

@@ -1,9 +1,6 @@
-# coding: utf8
-
-from hypothesis import given, settings
-
 import http_strategies
 from http_base import DaphneTestCase
+from hypothesis import given, settings
 
 
 class TestHTTPResponse(DaphneTestCase):
@@ -16,10 +13,11 @@ class TestHTTPResponse(DaphneTestCase):
         Lowercases and sorts headers, and strips transfer-encoding ones.
         """
         return sorted(
-            [
+            [(b"server", b"daphne")]
+            + [
                 (name.lower(), value.strip())
                 for name, value in headers
-                if name.lower() != b"transfer-encoding"
+                if name.lower() not in (b"server", b"transfer-encoding")
             ]
         )
 
@@ -169,3 +167,21 @@ class TestHTTPResponse(DaphneTestCase):
             str(context.exception),
             "Header value 'True' expected to be `bytes`, but got `<class 'bool'>`",
         )
+
+    def test_headers_type_raw(self):
+        """
+        Daphne returns a 500 error response if the application sends invalid
+        headers.
+        """
+        response = self.run_daphne_raw(
+            b"GET / HTTP/1.0\r\n\r\n",
+            responses=[
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [["foo", b"bar"]],
+                },
+                {"type": "http.response.body", "body": b""},
+            ],
+        )
+        self.assertTrue(response.startswith(b"HTTP/1.0 500 Internal Server Error"))

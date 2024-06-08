@@ -1,3 +1,151 @@
+4.1.2 (2024-04-11)
+------------------
+
+* Fixed a setuptools configuration error in 4.1.1.
+
+4.1.1 (2024-04-10)
+------------------
+
+* Fixed a twisted.plugin packaging error in 4.1.0.
+
+  Thanks to sdc50.
+
+4.1.0 (2024-02-10)
+------------------
+
+* Added support for Python 3.12.
+
+* Dropped support for EOL Python 3.7.
+
+* Handled root path for websocket scopes.
+
+* Validate HTTP header names as per RFC 9110.
+
+4.0.0 (2022-10-07)
+------------------
+
+Major versioning targeting use with Channels 4.0 and beyond. Except where
+noted should remain usable with Channels v3 projects, but updating Channels to the latest version is recommended.
+
+* Added a ``runserver`` command to run an ASGI Django development server.
+
+  Added ``"daphne"`` to the ``INSTALLED_APPS`` setting, before
+  ``"django.contrib.staticfiles"`` to enable:
+
+  INSTALLED_APPS = [
+    "daphne",
+    ...
+  ]
+
+  This replaces the Channels implementation of ``runserver``, which is removed
+  in Channels 4.0.
+
+* Made the ``DaphneProcess`` tests helper class compatible with the ``spawn``
+  process start method, which is used on macOS and Windows.
+
+  Note that requires Channels v4 if using with ``ChannelsLiveServerTestCase``.
+
+* Dropped support for Python 3.6.
+
+* Updated dependencies to the latest versions.
+
+  Previously a range of Twisted versions have been supported. Recent Twisted
+  releases (22.2, 22.4) have issued security fixes, so those are now the
+  minimum supported version. Given the stability of Twisted, supporting a
+  range of versions does not represent a good use of maintainer time. Going
+  forward the latest Twisted version will be required.
+
+* Set ``daphne`` as default ``Server`` header.
+
+  This can be configured with the ``--server-name`` CLI argument.
+
+  Added the new ``--no-server-name`` CLI argument to disable the ``Server``
+  header, which is equivalent to ``--server-name=` (an empty name).
+
+* Added ``--log-fmt`` CLI argument.
+
+* Added support for ``ASGI_THREADS`` environment variable, setting the maximum
+  number of workers used by a ``SyncToAsync`` thread-pool executor.
+
+  Set e.g. ``ASGI_THREADS=4 daphne ...`` when running to limit the number of
+  workers.
+
+* Removed deprecated ``--ws_protocols`` CLI option.
+
+3.0.2 (2021-04-07)
+------------------
+
+* Fixed a bug where ``send`` passed to applications wasn't a true async
+  function but a lambda wrapper, preventing it from being used with
+  ``asgiref.sync.async_to_sync()``.
+
+
+3.0.1 (2020-11-12)
+------------------
+
+* Fixed a bug where ``asyncio.CancelledError`` was not correctly handled on
+  Python 3.8+, resulting in incorrect protocol application cleanup.
+
+
+3.0.0 (2020-10-28)
+------------------
+
+* Updates internals to use ASGI v3 throughout. ``asgiref.compatibility`` is
+  used for older applications.
+
+* Consequently, the `--asgi-protocol` command-line option is removed.
+
+* HTTP request bodies are now read, and passed to the application, in chunks.
+
+* Added support for Python 3.9.
+
+* Dropped support for Python 3.5.
+
+
+2.5.0 (2020-04-15)
+------------------
+
+* Fixes compatability for twisted when running Python 3.8+ on Windows, by
+  setting ``asyncio.WindowsSelectorEventLoopPolicy`` as the event loop policy
+  in this case.
+
+* The internal ``daphne.testing.TestApplication`` now requires an addition
+  ``lock`` argument to ``__init__()``. This is expected to be an instance of
+  ``multiprocessing.Lock``.
+
+
+2.4.1 (2019-12-18)
+------------------
+
+* Avoids Twisted using the default event loop, for compatibility with Django
+  3.0's ``async_unsafe()`` decorator in threaded contexts, such as using the
+  auto-reloader.
+
+
+2.4.0 (2019-11-20)
+------------------
+
+* Adds CI testing against and support for Python 3.8.
+
+* Adds support for ``raw_path`` in ASGI scope.
+
+* Ensures an error response is sent to the client if the application sends
+  malformed headers.
+
+* Resolves an asyncio + multiprocessing problem when testing that would cause
+  the test suite to fail/hang on macOS.
+
+* Requires installing Twisted's TLS extras, via ``install_requires``.
+
+* Adds missing LICENSE to distribution.
+
+
+2.3.0 (2019-04-09)
+------------------
+
+* Added support for ASGI v3.
+
+
 2.2.5 (2019-01-31)
 ------------------
 
@@ -407,4 +555,4 @@
 
 * http.disconnect messages are now sent
 
-* Request handling speed significantly improved 
+* Request handling speed significantly improved
